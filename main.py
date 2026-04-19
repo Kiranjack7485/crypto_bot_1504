@@ -1,8 +1,8 @@
 # ==========================================================
-# TRUE SCALPER v6 PRECISION HYBRID SNIPER
-# Best of v4 + v5:
-# Not too late, not too early.
-# Pullback + confirmation + multi-timeframe alignment
+# TRUE SCALPER v7 ADAPTIVE SNIPER ENGINE
+# Practical sniper version:
+# Weighted scoring instead of zero-signal hard filters
+# Watches 24x7 | BTC ETH SOL BNB XRP
 # main.py
 # ==========================================================
 
@@ -34,7 +34,7 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 # ==========================================================
 # CONFIG
 # ==========================================================
-SYMBOLS = ["BTCUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 WAIT = 20
 LEVERAGE = 3
@@ -42,11 +42,14 @@ LEVERAGE = 3
 BASE_CAPITAL = 0.10
 STRONG_CAPITAL = 0.14
 
-TP_PCT = 0.60
-SL_PCT = 0.28
+TP_PCT = 0.62
+SL_PCT = 0.30
 
-MAX_HOLD_MIN = 28
+MAX_HOLD_MIN = 32
 COOLDOWN = 2400
+
+MIN_SCORE = 7
+STRONG_SCORE = 9
 
 open_trade = None
 last_trade = {}
@@ -100,7 +103,7 @@ def price(symbol):
     except:
         return None
 
-def klines(symbol, interval="5m", limit=150):
+def klines(symbol, interval="5m", limit=180):
     try:
         return client.get_klines(
             symbol=symbol,
@@ -112,10 +115,7 @@ def klines(symbol, interval="5m", limit=150):
 
 def set_leverage(symbol):
     try:
-        client.futures_change_leverage(
-            symbol=symbol,
-            leverage=LEVERAGE
-        )
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
     except:
         pass
 
@@ -180,7 +180,7 @@ def enrich(df):
     return df
 
 # ==========================================================
-# 15M TREND FILTER
+# TREND FILTER
 # ==========================================================
 def trend_15m(symbol):
 
@@ -197,81 +197,103 @@ def trend_15m(symbol):
     if c["ema20"] < c["ema50"]:
         return "DOWN"
 
-    return None
+    return "SIDE"
+
+def btc_bias():
+    t = trend_15m("BTCUSDT")
+    return t if t else "SIDE"
 
 # ==========================================================
-# V6 SIGNAL ENGINE
+# ADAPTIVE SCORE ENGINE
 # ==========================================================
-def precision_signal(df, trend):
+def score_signal(df, trend, market_bias):
 
     c = df.iloc[-1]
     p = df.iloc[-2]
 
+    # lookback for pullback in last 3 candles
+    last3 = df.iloc[-4:-1]
+
     # ======================================================
-    # BUY LOGIC
+    # BUY SCORE
     # ======================================================
     if trend == "UP":
 
-        local_up = c["ema20"] > c["ema50"]
+        score = 0
 
-        pullback = (
-            p["close"] <= p["ema9"] or
-            p["close"] <= p["ema20"]
-        )
+        # trend align
+        score += 2
 
-        restart = c["close"] > p["high"]
+        # local EMA alignment
+        if c["ema20"] > c["ema50"]:
+            score += 1
 
-        candle_strength = c["body"] > p["body"] * 1.10
+        # pullback seen recently
+        if any(last3["close"] <= last3["ema9"]) or any(last3["close"] <= last3["ema20"]):
+            score += 2
 
-        rsi_ok = 53 <= c["rsi"] <= 64
+        # breakout restart
+        if c["close"] > p["high"]:
+            score += 2
 
-        vol_ok = c["volume"] > c["vol_avg"] * 1.18
+        # RSI healthy
+        if 50 <= c["rsi"] <= 68:
+            score += 1
 
-        stretched = ((c["close"] - c["ema20"]) / c["ema20"]) > 0.007
+        # volume
+        if c["volume"] > c["vol_avg"] * 1.05:
+            score += 1
 
-        if (
-            local_up and pullback and restart and candle_strength
-            and rsi_ok and vol_ok and not stretched
-        ):
-            score = 8
+        # body strength
+        if c["body"] >= p["body"]:
+            score += 1
 
-            if c["volume"] > c["vol_avg"] * 1.35:
-                score = 9
+        # BTC supportive
+        if market_bias == "UP":
+            score += 1
 
-            return ("BUY", score)
+        # stretched penalty
+        if ((c["close"] - c["ema20"]) / c["ema20"]) > 0.010:
+            score -= 2
+
+        if score >= MIN_SCORE:
+            return ("BUY", min(score,10))
 
     # ======================================================
-    # SELL LOGIC
+    # SELL SCORE
     # ======================================================
     if trend == "DOWN":
 
-        local_dn = c["ema20"] < c["ema50"]
+        score = 0
 
-        pullback = (
-            p["close"] >= p["ema9"] or
-            p["close"] >= p["ema20"]
-        )
+        score += 2
 
-        restart = c["close"] < p["low"]
+        if c["ema20"] < c["ema50"]:
+            score += 1
 
-        candle_strength = c["body"] > p["body"] * 1.10
+        if any(last3["close"] >= last3["ema9"]) or any(last3["close"] >= last3["ema20"]):
+            score += 2
 
-        rsi_ok = 36 <= c["rsi"] <= 47
+        if c["close"] < p["low"]:
+            score += 2
 
-        vol_ok = c["volume"] > c["vol_avg"] * 1.18
+        if 32 <= c["rsi"] <= 50:
+            score += 1
 
-        stretched = ((c["ema20"] - c["close"]) / c["ema20"]) > 0.007
+        if c["volume"] > c["vol_avg"] * 1.05:
+            score += 1
 
-        if (
-            local_dn and pullback and restart and candle_strength
-            and rsi_ok and vol_ok and not stretched
-        ):
-            score = 8
+        if c["body"] >= p["body"]:
+            score += 1
 
-            if c["volume"] > c["vol_avg"] * 1.35:
-                score = 9
+        if market_bias == "DOWN":
+            score += 1
 
-            return ("SELL", score)
+        if ((c["ema20"] - c["close"]) / c["ema20"]) > 0.010:
+            score -= 2
+
+        if score >= MIN_SCORE:
+            return ("SELL", min(score,10))
 
     return None
 
@@ -283,7 +305,7 @@ def open_position(symbol, side, px, score):
 
     bal = balance()
 
-    use = STRONG_CAPITAL if score >= 9 else BASE_CAPITAL
+    use = STRONG_CAPITAL if score >= STRONG_SCORE else BASE_CAPITAL
 
     margin = bal * use
     pos = margin * LEVERAGE
@@ -296,7 +318,6 @@ def open_position(symbol, side, px, score):
     set_leverage(symbol)
 
     order = market(symbol, side, qty)
-
     if not order:
         send(f"❌ ORDER FAILED {symbol}")
         return
@@ -326,8 +347,9 @@ def open_position(symbol, side, px, score):
         f"Entry: {round(px,4)}\n"
         f"TP: {round(tp,4)}\n"
         f"SL: {round(sl,4)}\n"
-        f"Confidence: {score}/10\n"
-        f"Mode: Precision Hybrid Sniper\n"
+        f"Confidence Score: {score}/10\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"Mode: Adaptive Sniper Engine\n"
         f"🕒 {ts()}"
     )
 
@@ -376,21 +398,16 @@ def manage_trade():
     t = open_trade
 
     if t["side"] == "BUY":
-
         if px >= t["tp"]:
             close_position("TAKE PROFIT HIT", px)
             return
-
         if px <= t["sl"]:
             close_position("STOP LOSS HIT", px)
             return
-
     else:
-
         if px <= t["tp"]:
             close_position("TAKE PROFIT HIT", px)
             return
-
         if px >= t["sl"]:
             close_position("STOP LOSS HIT", px)
             return
@@ -404,10 +421,10 @@ def manage_trade():
 # STARTUP
 # ==========================================================
 send(
-    f"🚀 TRUE SCALPER v6 PRECISION HYBRID SNIPER STARTED\n"
+    f"🚀 TRUE SCALPER v7 ADAPTIVE SNIPER ENGINE STARTED\n"
     f"Balance: ${round(balance(),2)}\n"
-    f"Watching 24x7\n"
-    f"Logic: Pullback + Confirm + 15m Trend Align\n"
+    f"Watching: BTC ETH SOL BNB XRP\n"
+    f"Logic: Weighted Score Probability Model\n"
     f"🕒 {ts()}"
 )
 
@@ -430,6 +447,8 @@ while True:
             time.sleep(WAIT)
             continue
 
+        bias = btc_bias()
+
         for symbol in SYMBOLS:
 
             if symbol in last_trade:
@@ -437,18 +456,17 @@ while True:
                     continue
 
             try:
-                raw = klines(symbol, "5m", 150)
+                raw = klines(symbol, "5m", 180)
                 if not raw:
                     continue
 
                 df = enrich(frame(raw))
-
                 trend = trend_15m(symbol)
 
                 if not trend:
                     continue
 
-                sig = precision_signal(df, trend)
+                sig = score_signal(df, trend, bias)
 
                 if sig:
 
@@ -456,13 +474,13 @@ while True:
                     px = float(df.iloc[-1]["close"])
 
                     send(
-                        f"🔥 GOLDEN HYBRID SIGNAL\n\n"
+                        f"🔥 GOLDEN ADAPTIVE SIGNAL\n\n"
                         f"Coin: {symbol}\n"
                         f"Direction: {side}\n"
                         f"Price: {round(px,4)}\n"
                         f"Confidence: {score}/10\n"
                         f"15m Trend: {trend}\n"
-                        f"Detected: Pullback Continuation Entry\n"
+                        f"BTC Bias: {bias}\n"
                         f"🕒 {ts()}"
                     )
 

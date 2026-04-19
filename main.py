@@ -1,7 +1,8 @@
 # ==========================================================
-# TRUE SCALPER v5 EARLY TREND SNIPER
-# Precision upgrade:
-# Enters at beginning / mid trend, avoids late breakout traps
+# TRUE SCALPER v6 PRECISION HYBRID SNIPER
+# Best of v4 + v5:
+# Not too late, not too early.
+# Pullback + confirmation + multi-timeframe alignment
 # main.py
 # ==========================================================
 
@@ -13,7 +14,6 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from binance.client import Client
-from strategy import indicators
 
 load_dotenv()
 
@@ -26,7 +26,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ==========================================================
-# CLIENT
+# BINANCE
 # ==========================================================
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
@@ -42,11 +42,11 @@ LEVERAGE = 3
 BASE_CAPITAL = 0.10
 STRONG_CAPITAL = 0.14
 
-TP_PCT = 0.65
-SL_PCT = 0.30
+TP_PCT = 0.60
+SL_PCT = 0.28
 
-MAX_HOLD_MIN = 35
-COOLDOWN = 2700
+MAX_HOLD_MIN = 28
+COOLDOWN = 2400
 
 open_trade = None
 last_trade = {}
@@ -67,7 +67,7 @@ def ts():
     return f"UTC {utc_now().strftime('%H:%M:%S')} | IST {ist_now().strftime('%H:%M:%S')}"
 
 # ==========================================================
-# LOG + TELEGRAM
+# LOG / TELEGRAM
 # ==========================================================
 def send(msg):
     print(msg, flush=True)
@@ -83,27 +83,13 @@ def send(msg):
             pass
 
 # ==========================================================
-# SESSION (24x7 sniper but priority windows)
-# ==========================================================
-def session_name():
-    m = utc_now().hour * 60 + utc_now().minute
-
-    if 420 <= m <= 720:
-        return "INDIA PRIORITY"
-
-    if 780 <= m <= 1080:
-        return "LONDON/US PRIORITY"
-
-    return "BACKGROUND WATCH"
-
-# ==========================================================
-# BINANCE HELPERS
+# HELPERS
 # ==========================================================
 def balance():
     try:
-        for x in client.futures_account_balance():
-            if x["asset"] == "USDT":
-                return float(x["balance"])
+        for row in client.futures_account_balance():
+            if row["asset"] == "USDT":
+                return float(row["balance"])
     except:
         return 0
     return 0
@@ -114,19 +100,22 @@ def price(symbol):
     except:
         return None
 
-def klines(symbol):
+def klines(symbol, interval="5m", limit=150):
     try:
         return client.get_klines(
             symbol=symbol,
-            interval="5m",
-            limit=150
+            interval=interval,
+            limit=limit
         )
     except:
         return None
 
-def leverage(symbol):
+def set_leverage(symbol):
     try:
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        client.futures_change_leverage(
+            symbol=symbol,
+            leverage=LEVERAGE
+        )
     except:
         pass
 
@@ -157,8 +146,16 @@ def market(symbol, side, qty):
         return None
 
 # ==========================================================
-# INDICATORS
+# DATAFRAME
 # ==========================================================
+def frame(raw):
+    df = pd.DataFrame(raw, columns=[
+        "time","open","high","low","close","volume",
+        "ct","qv","n","tb","tq","ig"
+    ])
+    df = df[["open","high","low","close","volume"]].astype(float)
+    return df
+
 def enrich(df):
 
     df["ema9"] = df["close"].ewm(span=9).mean()
@@ -170,44 +167,72 @@ def enrich(df):
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
 
-    avg_gain = up.rolling(14).mean()
-    avg_loss = down.rolling(14).mean()
+    gain = up.rolling(14).mean()
+    loss = down.rolling(14).mean()
 
-    rs = avg_gain / avg_loss
+    rs = gain / loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df["vol_avg"] = df["volume"].rolling(20).mean()
 
+    df["body"] = (df["close"] - df["open"]).abs()
+
     return df
 
 # ==========================================================
-# EARLY TREND SNIPER LOGIC
+# 15M TREND FILTER
 # ==========================================================
-def sniper_signal(df):
+def trend_15m(symbol):
+
+    raw = klines(symbol, "15m", 120)
+    if not raw:
+        return None
+
+    df = enrich(frame(raw))
+    c = df.iloc[-1]
+
+    if c["ema20"] > c["ema50"]:
+        return "UP"
+
+    if c["ema20"] < c["ema50"]:
+        return "DOWN"
+
+    return None
+
+# ==========================================================
+# V6 SIGNAL ENGINE
+# ==========================================================
+def precision_signal(df, trend):
 
     c = df.iloc[-1]
     p = df.iloc[-2]
-    p2 = df.iloc[-3]
 
-    # ------------------------------------
-    # LONG SETUP
-    # Trend already exists but not stretched
-    # Pullback happened
-    # Fresh momentum restarting
-    # ------------------------------------
-    if c["ema20"] > c["ema50"]:
+    # ======================================================
+    # BUY LOGIC
+    # ======================================================
+    if trend == "UP":
 
-        pullback = p["close"] <= p["ema9"] or p["close"] <= p["ema20"]
+        local_up = c["ema20"] > c["ema50"]
+
+        pullback = (
+            p["close"] <= p["ema9"] or
+            p["close"] <= p["ema20"]
+        )
 
         restart = c["close"] > p["high"]
 
-        healthy_rsi = 52 <= c["rsi"] <= 64
+        candle_strength = c["body"] > p["body"] * 1.10
 
-        volume = c["volume"] > c["vol_avg"] * 1.12
+        rsi_ok = 53 <= c["rsi"] <= 64
 
-        not_stretched = ((c["close"] - c["ema20"]) / c["ema20"]) < 0.006
+        vol_ok = c["volume"] > c["vol_avg"] * 1.18
 
-        if pullback and restart and healthy_rsi and volume and not_stretched:
+        stretched = ((c["close"] - c["ema20"]) / c["ema20"]) > 0.007
+
+        if (
+            local_up and pullback and restart and candle_strength
+            and rsi_ok and vol_ok and not stretched
+        ):
             score = 8
 
             if c["volume"] > c["vol_avg"] * 1.35:
@@ -215,22 +240,32 @@ def sniper_signal(df):
 
             return ("BUY", score)
 
-    # ------------------------------------
-    # SHORT SETUP
-    # ------------------------------------
-    if c["ema20"] < c["ema50"]:
+    # ======================================================
+    # SELL LOGIC
+    # ======================================================
+    if trend == "DOWN":
 
-        pullback = p["close"] >= p["ema9"] or p["close"] >= p["ema20"]
+        local_dn = c["ema20"] < c["ema50"]
+
+        pullback = (
+            p["close"] >= p["ema9"] or
+            p["close"] >= p["ema20"]
+        )
 
         restart = c["close"] < p["low"]
 
-        healthy_rsi = 36 <= c["rsi"] <= 48
+        candle_strength = c["body"] > p["body"] * 1.10
 
-        volume = c["volume"] > c["vol_avg"] * 1.12
+        rsi_ok = 36 <= c["rsi"] <= 47
 
-        not_stretched = ((c["ema20"] - c["close"]) / c["ema20"]) < 0.006
+        vol_ok = c["volume"] > c["vol_avg"] * 1.18
 
-        if pullback and restart and healthy_rsi and volume and not_stretched:
+        stretched = ((c["ema20"] - c["close"]) / c["ema20"]) > 0.007
+
+        if (
+            local_dn and pullback and restart and candle_strength
+            and rsi_ok and vol_ok and not stretched
+        ):
             score = 8
 
             if c["volume"] > c["vol_avg"] * 1.35:
@@ -243,7 +278,7 @@ def sniper_signal(df):
 # ==========================================================
 # ENTRY
 # ==========================================================
-def create_trade(symbol, side, px, score):
+def open_position(symbol, side, px, score):
     global open_trade
 
     bal = balance()
@@ -258,12 +293,12 @@ def create_trade(symbol, side, px, score):
     if qty <= 0:
         return
 
-    leverage(symbol)
+    set_leverage(symbol)
 
     order = market(symbol, side, qty)
 
     if not order:
-        send(f"❌ Order Failed {symbol}")
+        send(f"❌ ORDER FAILED {symbol}")
         return
 
     if side == "BUY":
@@ -291,16 +326,15 @@ def create_trade(symbol, side, px, score):
         f"Entry: {round(px,4)}\n"
         f"TP: {round(tp,4)}\n"
         f"SL: {round(sl,4)}\n"
-        f"Qty: {qty}\n"
         f"Confidence: {score}/10\n"
-        f"Mode: Early Trend Sniper\n"
+        f"Mode: Precision Hybrid Sniper\n"
         f"🕒 {ts()}"
     )
 
 # ==========================================================
 # EXIT
 # ==========================================================
-def close_trade(reason, px):
+def close_position(reason, px):
     global open_trade
 
     t = open_trade
@@ -309,12 +343,12 @@ def close_trade(reason, px):
 
     if t["side"] == "BUY":
         pnl = ((px - t["entry"]) / t["entry"]) * t["pos"]
-        side = "SELL"
+        close_side = "SELL"
     else:
         pnl = ((t["entry"] - px) / t["entry"]) * t["pos"]
-        side = "BUY"
+        close_side = "BUY"
 
-    market(t["symbol"], side, t["qty"])
+    market(t["symbol"], close_side, t["qty"])
 
     mins = int((time.time() - t["time"]) / 60)
 
@@ -331,6 +365,7 @@ def close_trade(reason, px):
     open_trade = None
 
 def manage_trade():
+
     if not open_trade:
         return
 
@@ -343,36 +378,36 @@ def manage_trade():
     if t["side"] == "BUY":
 
         if px >= t["tp"]:
-            close_trade("TAKE PROFIT HIT", px)
+            close_position("TAKE PROFIT HIT", px)
             return
 
         if px <= t["sl"]:
-            close_trade("STOP LOSS HIT", px)
+            close_position("STOP LOSS HIT", px)
             return
 
     else:
 
         if px <= t["tp"]:
-            close_trade("TAKE PROFIT HIT", px)
+            close_position("TAKE PROFIT HIT", px)
             return
 
         if px >= t["sl"]:
-            close_trade("STOP LOSS HIT", px)
+            close_position("STOP LOSS HIT", px)
             return
 
     held = int((time.time() - t["time"]) / 60)
 
     if held >= MAX_HOLD_MIN:
-        close_trade("SMART EXIT", px)
+        close_position("SMART EXIT", px)
 
 # ==========================================================
 # STARTUP
 # ==========================================================
 send(
-    f"🚀 TRUE SCALPER v5 EARLY TREND SNIPER STARTED\n"
+    f"🚀 TRUE SCALPER v6 PRECISION HYBRID SNIPER STARTED\n"
     f"Balance: ${round(balance(),2)}\n"
     f"Watching 24x7\n"
-    f"Objective: Catch start/mid trend only\n"
+    f"Logic: Pullback + Confirm + 15m Trend Align\n"
     f"🕒 {ts()}"
 )
 
@@ -386,7 +421,6 @@ while True:
             send(
                 f"💓 BOT ACTIVE\n"
                 f"Open Trade: {'YES' if open_trade else 'NO'}\n"
-                f"Mode: {session_name()}\n"
                 f"🕒 {ts()}"
             )
             last_heartbeat = time.time()
@@ -403,21 +437,18 @@ while True:
                     continue
 
             try:
-                raw = klines(symbol)
-
+                raw = klines(symbol, "5m", 150)
                 if not raw:
                     continue
 
-                df = pd.DataFrame(raw, columns=[
-                    "time","open","high","low","close","volume",
-                    "ct","qv","n","tb","tq","ig"
-                ])
+                df = enrich(frame(raw))
 
-                df = df[["open","high","low","close","volume"]].astype(float)
+                trend = trend_15m(symbol)
 
-                df = enrich(df)
+                if not trend:
+                    continue
 
-                sig = sniper_signal(df)
+                sig = precision_signal(df, trend)
 
                 if sig:
 
@@ -425,17 +456,17 @@ while True:
                     px = float(df.iloc[-1]["close"])
 
                     send(
-                        f"🔥 GOLDEN SNIPER SIGNAL\n\n"
+                        f"🔥 GOLDEN HYBRID SIGNAL\n\n"
                         f"Coin: {symbol}\n"
                         f"Direction: {side}\n"
                         f"Price: {round(px,4)}\n"
                         f"Confidence: {score}/10\n"
-                        f"Detected: Start/Mid Trend Opportunity\n"
-                        f"Session: {session_name()}\n"
+                        f"15m Trend: {trend}\n"
+                        f"Detected: Pullback Continuation Entry\n"
                         f"🕒 {ts()}"
                     )
 
-                    create_trade(symbol, side, px, score)
+                    open_position(symbol, side, px, score)
 
                     last_trade[symbol] = time.time()
                     break

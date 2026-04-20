@@ -1,42 +1,31 @@
 # ==========================================================
-# TRUE SCALPER v8 SESSION SNIPER PRO
-# Focus:
-# Wait for strong long candles (momentum confirmation)
-# Enter before ~40% trend expansion (not too early / not too late)
-# Multi-timeframe confirmation: 5m + 15m + 1h
-# Session restricted sniper execution
-# main.py
+# TRUE SCALPER v9 – MOMENTUM SESSION HUNTER
+# Balanced system:
+# - Session restricted (v4 strength)
+# - Adaptive scoring (v7 strength)
+# - Medium + strong momentum (fix v8)
+# - Early-mid trend capture (your core goal)
 # ==========================================================
 
-import os
-import time
-import math
-import requests
-import pandas as pd
+import os, time, math, requests, pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from binance.client import Client
 
 load_dotenv()
 
-# ==========================================================
-# ENV
-# ==========================================================
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ==========================================================
-# BINANCE
-# ==========================================================
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ==========================================================
 # CONFIG
 # ==========================================================
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
 
 WAIT = 20
 LEVERAGE = 3
@@ -44,486 +33,307 @@ LEVERAGE = 3
 BASE_CAPITAL = 0.10
 STRONG_CAPITAL = 0.14
 
-TP_PCT = 0.68
-SL_PCT = 0.32
+TP_PCT = 0.65
+SL_PCT = 0.30
 
-MAX_HOLD_MIN = 34
+MIN_SCORE = 6
+STRONG_SCORE = 8
+
+MAX_HOLD_MIN = 30
 COOLDOWN = 2400
-
-MIN_SCORE = 8
-STRONG_SCORE = 10
 
 open_trade = None
 last_trade = {}
 last_heartbeat = 0
 
-# ==========================================================
-# TIME
-# ==========================================================
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def utc_now():
-    return datetime.now(timezone.utc)
-
-def ist_now():
-    return utc_now().astimezone(IST)
-
+# ==========================================================
+# UTIL
+# ==========================================================
 def ts():
-    return f"UTC {utc_now().strftime('%H:%M:%S')} | IST {ist_now().strftime('%H:%M:%S')}"
+    now = datetime.now(timezone.utc)
+    ist = now.astimezone(IST)
+    return f"UTC {now.strftime('%H:%M:%S')} | IST {ist.strftime('%H:%M:%S')}"
 
-# ==========================================================
-# TELEGRAM / LOG
-# ==========================================================
 def send(msg):
     print(msg, flush=True)
-
     if TOKEN and CHAT_ID:
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=8
-            )
-        except:
-            pass
+            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": msg}, timeout=5)
+        except: pass
 
 # ==========================================================
-# SESSION ENGINE
+# SESSION CONTROL
 # ==========================================================
-def current_session():
+def get_session():
+    now = datetime.now(IST)
+    mins = now.hour*60 + now.minute
 
-    now = ist_now()
-    mins = now.hour * 60 + now.minute
-
-    # India momentum
-    if 735 <= mins <= 1035:      # 12:15 to 17:15
-        return "INDIA"
-
-    # London entry
-    if 1065 <= mins <= 1290:     # 17:45 to 21:30
-        return "LONDON"
-
-    # US momentum
-    if 1290 <= mins <= 1425:     # 21:30 to 23:45
-        return "US"
-
+    if 735 <= mins <= 1035: return "INDIA"
+    if 1065 <= mins <= 1290: return "LONDON"
+    if 1290 <= mins <= 1425: return "US"
     return None
 
-def allowed_symbols(session):
-
-    if session == "INDIA":
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
-    if session == "LONDON":
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-
-    if session == "US":
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-
-    return []
+def session_symbols(sess):
+    if sess == "INDIA":
+        return ["BTCUSDT","ETHUSDT","BNBUSDT"]
+    return ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
 
 # ==========================================================
-# HELPERS
+# DATA
 # ==========================================================
-def balance():
+def klines(symbol, interval, limit=200):
     try:
-        for row in client.futures_account_balance():
-            if row["asset"] == "USDT":
-                return float(row["balance"])
-    except:
-        return 0
-    return 0
+        return client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    except: return None
 
-def price(symbol):
-    try:
-        return float(client.get_symbol_ticker(symbol=symbol)["price"])
-    except:
-        return None
-
-def klines(symbol, interval="5m", limit=220):
-    try:
-        return client.get_klines(
-            symbol=symbol,
-            interval=interval,
-            limit=limit
-        )
-    except:
-        return None
-
-def set_leverage(symbol):
-    try:
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-    except:
-        pass
-
-def step(symbol):
-    try:
-        info = client.futures_exchange_info()
-        for s in info["symbols"]:
-            if s["symbol"] == symbol:
-                for f in s["filters"]:
-                    if f["filterType"] == "LOT_SIZE":
-                        return float(f["stepSize"])
-    except:
-        return 0.001
-    return 0.001
-
-def floor_qty(qty, st):
-    return math.floor(qty / st) * st
-
-def market(symbol, side, qty):
-    try:
-        return client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            quantity=qty
-        )
-    except:
-        return None
-
-# ==========================================================
-# DATAFRAME
-# ==========================================================
 def frame(raw):
     df = pd.DataFrame(raw, columns=[
-        "time","open","high","low","close","volume",
-        "ct","qv","n","tb","tq","ig"
-    ])
-    df = df[["open","high","low","close","volume"]].astype(float)
+        "t","o","h","l","c","v","ct","qv","n","tb","tq","ig"])
+    df = df[["o","h","l","c","v"]].astype(float)
+    df.columns = ["open","high","low","close","volume"]
     return df
 
 def enrich(df):
-
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
 
     delta = df["close"].diff()
-
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-
-    gain = up.rolling(14).mean()
-    loss = down.rolling(14).mean()
-
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100/(1+rs))
 
-    df["body"] = (df["close"] - df["open"]).abs()
-    df["range"] = df["high"] - df["low"]
-
+    df["body"] = abs(df["close"] - df["open"])
     df["body_avg"] = df["body"].rolling(20).mean()
     df["vol_avg"] = df["volume"].rolling(20).mean()
 
     return df
 
 # ==========================================================
-# TREND CHECKS
+# TREND
 # ==========================================================
-def tf_trend(symbol, interval):
-
-    raw = klines(symbol, interval, 150)
-    if not raw:
-        return None
-
+def trend(symbol, tf):
+    raw = klines(symbol, tf, 120)
+    if not raw: return None
     df = enrich(frame(raw))
     c = df.iloc[-1]
-
-    if c["ema20"] > c["ema50"]:
-        return "UP"
-
-    if c["ema20"] < c["ema50"]:
-        return "DOWN"
-
+    if c["ema20"] > c["ema50"]: return "UP"
+    if c["ema20"] < c["ema50"]: return "DOWN"
     return "SIDE"
 
 # ==========================================================
-# LONG CANDLE TREND SNIPER
+# MOMENTUM ENGINE (CORE FIX)
 # ==========================================================
-def sniper_signal(df, t15, t1h):
+def momentum_signal(df, t15, t1h):
 
     c = df.iloc[-1]
     p = df.iloc[-2]
+    p2 = df.iloc[-3]
 
-    # candle quality
-    body_ratio = c["body"] / c["range"] if c["range"] > 0 else 0
-    long_body = c["body"] > c["body_avg"] * 1.45
-    volume_push = c["volume"] > c["vol_avg"] * 1.15
+    # breakout in last 2 candles
+    breakout_up = (c["close"] > p["high"]) or (p["close"] > p2["high"])
+    breakout_dn = (c["close"] < p["low"]) or (p["close"] < p2["low"])
+
+    body_ok = c["body"] > df["body_avg"].iloc[-1] * 1.18
+    volume_ok = c["volume"] > df["vol_avg"].iloc[-1] * 1.05
+
+    score = 0
 
     # ======================================================
     # BUY
     # ======================================================
     if t15 == "UP" and t1h == "UP":
 
-        score = 0
+        score += 2
 
-        if c["ema20"] > c["ema50"]:
-            score += 2
+        if c["ema20"] > c["ema50"]: score += 1
+        if breakout_up: score += 2
+        if body_ok: score += 1
+        if volume_ok: score += 1
 
-        if c["close"] > p["high"]:
-            score += 2
+        if 50 <= c["rsi"] <= 70: score += 1
 
-        if long_body:
-            score += 2
-
-        if body_ratio > 0.62:
-            score += 1
-
-        if volume_push:
-            score += 1
-
-        if 54 <= c["rsi"] <= 67:
-            score += 1
-
-        # not too late = not more than 40% stretched move
         stretch = (c["close"] - c["ema20"]) / c["ema20"]
-
-        if stretch < 0.0045:
-            score += 1
-        elif stretch > 0.010:
-            score -= 3
+        if stretch < 0.008: score += 1
+        elif stretch > 0.015: score -= 2
 
         if score >= MIN_SCORE:
-            return ("BUY", min(score,10))
+            return ("BUY", score)
 
     # ======================================================
     # SELL
     # ======================================================
     if t15 == "DOWN" and t1h == "DOWN":
 
-        score = 0
+        score += 2
 
-        if c["ema20"] < c["ema50"]:
-            score += 2
+        if c["ema20"] < c["ema50"]: score += 1
+        if breakout_dn: score += 2
+        if body_ok: score += 1
+        if volume_ok: score += 1
 
-        if c["close"] < p["low"]:
-            score += 2
-
-        if long_body:
-            score += 2
-
-        if body_ratio > 0.62:
-            score += 1
-
-        if volume_push:
-            score += 1
-
-        if 33 <= c["rsi"] <= 46:
-            score += 1
+        if 30 <= c["rsi"] <= 50: score += 1
 
         stretch = (c["ema20"] - c["close"]) / c["ema20"]
-
-        if stretch < 0.0045:
-            score += 1
-        elif stretch > 0.010:
-            score -= 3
+        if stretch < 0.008: score += 1
+        elif stretch > 0.015: score -= 2
 
         if score >= MIN_SCORE:
-            return ("SELL", min(score,10))
+            return ("SELL", score)
 
     return None
 
 # ==========================================================
-# ENTRY
+# EXECUTION
 # ==========================================================
-def open_position(symbol, side, px, score):
+def price(symbol):
+    try: return float(client.get_symbol_ticker(symbol=symbol)["price"])
+    except: return None
+
+def balance():
+    try:
+        for x in client.futures_account_balance():
+            if x["asset"] == "USDT":
+                return float(x["balance"])
+    except: return 0
+
+def step(symbol):
+    info = client.futures_exchange_info()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    return float(f["stepSize"])
+    return 0.001
+
+def qty(symbol, px, capital):
+    q = capital / px
+    st = step(symbol)
+    return math.floor(q/st)*st
+
+def order(symbol, side, q):
+    try:
+        return client.futures_create_order(
+            symbol=symbol, side=side, type="MARKET", quantity=q)
+    except: return None
+
+# ==========================================================
+# TRADE
+# ==========================================================
+def open_trade_fn(symbol, side, px, score):
     global open_trade
 
     bal = balance()
+    cap = STRONG_CAPITAL if score >= STRONG_SCORE else BASE_CAPITAL
 
-    use = STRONG_CAPITAL if score >= STRONG_SCORE else BASE_CAPITAL
+    margin = bal * cap * LEVERAGE
+    q = qty(symbol, px, margin)
 
-    margin = bal * use
-    pos = margin * LEVERAGE
+    if q <= 0: return
 
-    qty = floor_qty(pos / px, step(symbol))
-    if qty <= 0:
-        return
-
-    set_leverage(symbol)
-
-    if not market(symbol, side, qty):
-        send(f"❌ ORDER FAILED {symbol}")
-        return
+    order(symbol, side, q)
 
     if side == "BUY":
-        tp = px * (1 + TP_PCT / 100)
-        sl = px * (1 - SL_PCT / 100)
+        tp = px * (1 + TP_PCT/100)
+        sl = px * (1 - SL_PCT/100)
     else:
-        tp = px * (1 - TP_PCT / 100)
-        sl = px * (1 + SL_PCT / 100)
+        tp = px * (1 - TP_PCT/100)
+        sl = px * (1 + SL_PCT/100)
 
     open_trade = {
-        "symbol": symbol,
-        "side": side,
-        "entry": px,
-        "tp": tp,
-        "sl": sl,
-        "qty": qty,
-        "pos": pos,
+        "symbol": symbol, "side": side,
+        "entry": px, "tp": tp, "sl": sl,
+        "qty": q, "pos": margin,
         "time": time.time()
     }
 
-    send(
-        f"✅ ENTRY EXECUTED\n\n"
-        f"Coin: {symbol}\n"
-        f"Side: {side}\n"
-        f"Entry: {round(px,4)}\n"
-        f"TP: {round(tp,4)}\n"
-        f"SL: {round(sl,4)}\n"
-        f"Score: {score}/10\n"
-        f"Mode: Session Sniper Pro\n"
-        f"🕒 {ts()}"
-    )
+    send(f"✅ ENTRY {symbol} {side}\nPrice: {px}\nScore: {score}\n🕒 {ts()}")
 
-# ==========================================================
-# EXIT
-# ==========================================================
-def close_position(reason, px):
+def manage_trade():
+    global open_trade
+
+    if not open_trade: return
+
+    px = price(open_trade["symbol"])
+    if not px: return
+
+    t = open_trade
+
+    if t["side"] == "BUY":
+        if px >= t["tp"]: return close("TP", px)
+        if px <= t["sl"]: return close("SL", px)
+    else:
+        if px <= t["tp"]: return close("TP", px)
+        if px >= t["sl"]: return close("SL", px)
+
+    if (time.time()-t["time"])/60 > MAX_HOLD_MIN:
+        close("TIME EXIT", px)
+
+def close(reason, px):
     global open_trade
 
     t = open_trade
-    if not t:
-        return
 
-    if t["side"] == "BUY":
-        pnl = ((px - t["entry"]) / t["entry"]) * t["pos"]
-        close_side = "SELL"
-    else:
-        pnl = ((t["entry"] - px) / t["entry"]) * t["pos"]
-        close_side = "BUY"
+    pnl = ((px - t["entry"]) / t["entry"]) * t["pos"]
+    if t["side"] == "SELL":
+        pnl = -pnl
 
-    market(t["symbol"], close_side, t["qty"])
+    order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
 
-    mins = int((time.time() - t["time"]) / 60)
-
-    send(
-        f"{'🎯' if pnl >=0 else '🛑'} {reason}\n\n"
-        f"{t['symbol']} {t['side']}\n"
-        f"Entry: {round(t['entry'],4)}\n"
-        f"Exit: {round(px,4)}\n"
-        f"PnL: ${round(pnl,2)}\n"
-        f"Held: {mins} mins\n"
-        f"🕒 {ts()}"
-    )
+    send(f"{reason} | PnL: {round(pnl,2)} | {t['symbol']}")
 
     open_trade = None
 
-def manage_trade():
-
-    if not open_trade:
-        return
-
-    px = price(open_trade["symbol"])
-    if not px:
-        return
-
-    t = open_trade
-
-    if t["side"] == "BUY":
-        if px >= t["tp"]:
-            close_position("TAKE PROFIT HIT", px)
-            return
-        if px <= t["sl"]:
-            close_position("STOP LOSS HIT", px)
-            return
-    else:
-        if px <= t["tp"]:
-            close_position("TAKE PROFIT HIT", px)
-            return
-        if px >= t["sl"]:
-            close_position("STOP LOSS HIT", px)
-            return
-
-    if int((time.time() - t["time"]) / 60) >= MAX_HOLD_MIN:
-        close_position("SMART EXIT", px)
-
 # ==========================================================
-# STARTUP
+# START
 # ==========================================================
-send(
-    f"🚀 TRUE SCALPER v8 SESSION SNIPER PRO STARTED\n"
-    f"Balance: ${round(balance(),2)}\n"
-    f"Strategy: Long Candle Trend Confirmation\n"
-    f"TF Align: 5m + 15m + 1H\n"
-    f"Session Restricted Enabled\n"
-    f"🕒 {ts()}"
-)
+send(f"🚀 v9 MOMENTUM SESSION HUNTER STARTED\n🕒 {ts()}")
 
 # ==========================================================
 # LOOP
 # ==========================================================
 while True:
-
     try:
-        if time.time() - last_heartbeat > 3600:
-            sess = current_session() or "WAITING"
-            send(
-                f"💓 BOT ACTIVE\n"
-                f"Session: {sess}\n"
-                f"Open Trade: {'YES' if open_trade else 'NO'}\n"
-                f"🕒 {ts()}"
-            )
-            last_heartbeat = time.time()
 
         if open_trade:
             manage_trade()
             time.sleep(WAIT)
             continue
 
-        session = current_session()
-
-        if not session:
+        sess = get_session()
+        if not sess:
             time.sleep(WAIT)
             continue
 
-        watchlist = allowed_symbols(session)
+        watch = session_symbols(sess)
 
-        for symbol in watchlist:
+        for s in watch:
 
-            if symbol in last_trade:
-                if time.time() - last_trade[symbol] < COOLDOWN:
-                    continue
+            if s in last_trade and time.time()-last_trade[s] < COOLDOWN:
+                continue
 
-            try:
-                raw = klines(symbol, "5m", 220)
-                if not raw:
-                    continue
+            raw = klines(s, "5m", 200)
+            if not raw: continue
 
-                df = enrich(frame(raw))
+            df = enrich(frame(raw))
 
-                t15 = tf_trend(symbol, "15m")
-                t1h = tf_trend(symbol, "1h")
+            t15 = trend(s, "15m")
+            t1h = trend(s, "1h")
 
-                if not t15 or not t1h:
-                    continue
+            sig = momentum_signal(df, t15, t1h)
 
-                sig = sniper_signal(df, t15, t1h)
+            if sig:
+                side, score = sig
+                px = df.iloc[-1]["close"]
 
-                if sig:
+                send(f"🔥 SIGNAL {s} {side} | Score {score}")
+                open_trade_fn(s, side, px, score)
 
-                    side, score = sig
-                    px = float(df.iloc[-1]["close"])
-
-                    send(
-                        f"🔥 GOLDEN SESSION SIGNAL\n\n"
-                        f"Coin: {symbol}\n"
-                        f"Direction: {side}\n"
-                        f"Price: {round(px,4)}\n"
-                        f"Score: {score}/10\n"
-                        f"15m: {t15}\n"
-                        f"1H: {t1h}\n"
-                        f"Session: {session}\n"
-                        f"🕒 {ts()}"
-                    )
-
-                    open_position(symbol, side, px, score)
-
-                    last_trade[symbol] = time.time()
-                    break
-
-            except:
-                pass
+                last_trade[s] = time.time()
+                break
 
         time.sleep(WAIT)
 

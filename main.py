@@ -1,12 +1,8 @@
 # ==========================================================
-# TRUE SCALPER v4 - CLEAN PRO VERSION
-# Strategy unchanged (your best performer)
-# Only improvements:
-# - Clean logs
-# - Structured Telegram alerts
+# TRUE SCALPER V5.1 - FINAL SNIPER (PRECISION FIXED)
 # ==========================================================
 
-import os, time, math, requests, pandas as pd
+import os, time, requests, pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from binance.client import Client
@@ -25,14 +21,13 @@ SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
 
 WAIT = 20
 LEVERAGE = 3
-
 TP = 0.6
 SL = 0.3
-
 CAPITAL = 0.12
 
 open_trade = None
 last_heartbeat = 0
+last_trade_time = {}
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -60,15 +55,10 @@ def send(msg):
             pass
 
 # ==========================================================
-# SESSION
+# SESSION (24/7 CRYPTO)
 # ==========================================================
 def session():
-
-    mins = datetime.now(IST).hour * 60 + datetime.now(IST).minute
-
-    if 1065 <= mins <= 1425:
-        return "ACTIVE"
-    return None
+    return True
 
 # ==========================================================
 # DATA
@@ -89,17 +79,14 @@ def frame(raw):
 def enrich(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
-
     df["body"] = abs(df["close"] - df["open"])
     df["body_avg"] = df["body"].rolling(20).mean()
-
     return df
 
 # ==========================================================
-# SIGNAL (UNCHANGED CORE)
+# SIGNAL
 # ==========================================================
 def signal(df):
-
     c = df.iloc[-1]
     p = df.iloc[-2]
 
@@ -114,6 +101,35 @@ def signal(df):
     return None
 
 # ==========================================================
+# PRECISION ENGINE (CRITICAL FIX)
+# ==========================================================
+symbol_filters = {}
+
+def load_filters():
+    global symbol_filters
+    info = client.futures_exchange_info()
+
+    for s in info["symbols"]:
+        symbol = s["symbol"]
+        filters = {f["filterType"]: f for f in s["filters"]}
+
+        step = float(filters["LOT_SIZE"]["stepSize"])
+        tick = float(filters["PRICE_FILTER"]["tickSize"])
+
+        symbol_filters[symbol] = {
+            "step": step,
+            "tick": tick
+        }
+
+def round_qty(symbol, qty):
+    step = symbol_filters[symbol]["step"]
+    return round(qty - (qty % step), 8)
+
+def round_price(symbol, price):
+    tick = symbol_filters[symbol]["tick"]
+    return round(price - (price % tick), 8)
+
+# ==========================================================
 # EXECUTION
 # ==========================================================
 def price(symbol):
@@ -126,17 +142,35 @@ def balance():
 
 def order(symbol, side, qty):
     return client.futures_create_order(
-        symbol=symbol, side=side, type="MARKET", quantity=qty)
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        quantity=qty
+    )
 
 def open_pos(symbol, side, px):
-
     global open_trade
+
+    # anti-spam cooldown
+    if symbol in last_trade_time:
+        if time.time() - last_trade_time[symbol] < 120:
+            return
 
     bal = balance()
     pos = bal * CAPITAL * LEVERAGE
-    qty = round(pos / px, 3)
 
-    order(symbol, side, qty)
+    qty = pos / px
+    qty = round_qty(symbol, qty)
+
+    if qty <= 0:
+        send(f"❌ QTY ERROR {symbol}")
+        return
+
+    try:
+        order(symbol, side, qty)
+    except Exception as e:
+        send(f"❌ ORDER ERROR {symbol}: {str(e)}")
+        return
 
     if side == "BUY":
         tp = px * (1 + TP/100)
@@ -144,6 +178,9 @@ def open_pos(symbol, side, px):
     else:
         tp = px * (1 - TP/100)
         sl = px * (1 + SL/100)
+
+    tp = round_price(symbol, tp)
+    sl = round_price(symbol, sl)
 
     open_trade = {
         "symbol": symbol,
@@ -156,22 +193,18 @@ def open_pos(symbol, side, px):
         "time": time.time()
     }
 
+    last_trade_time[symbol] = time.time()
+
     send(
-        f"🚀 ENTRY EXECUTED\n\n"
-        f"{symbol} | {side}\n"
-        f"Entry: {round(px,4)}\n"
-        f"TP: {round(tp,4)}\n"
-        f"SL: {round(sl,4)}\n"
-        f"Capital: ${round(pos,2)}\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"🕒 {ts()}"
+        f"🚀 ENTRY\n{symbol} {side}\n"
+        f"Entry: {round(px,4)}\nTP: {tp}\nSL: {sl}\n"
+        f"Qty: {qty}\n🕒 {ts()}"
     )
 
 # ==========================================================
 # EXIT
 # ==========================================================
 def manage():
-
     global open_trade
 
     if not open_trade:
@@ -182,21 +215,19 @@ def manage():
 
     if t["side"] == "BUY":
         if px >= t["tp"]:
-            return close("TP HIT", px)
+            return close("TP", px)
         if px <= t["sl"]:
-            return close("SL HIT", px)
-
+            return close("SL", px)
     else:
         if px <= t["tp"]:
-            return close("TP HIT", px)
+            return close("TP", px)
         if px >= t["sl"]:
-            return close("SL HIT", px)
+            return close("SL", px)
 
-    if (time.time()-t["time"])/60 > 30:
-        close("TIME EXIT", px)
+    if (time.time()-t["time"])/60 > 25:
+        close("TIME", px)
 
 def close(reason, px):
-
     global open_trade
 
     t = open_trade
@@ -205,15 +236,16 @@ def close(reason, px):
     if t["side"] == "SELL":
         pnl = -pnl
 
-    order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
+    try:
+        order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
+    except Exception as e:
+        send(f"❌ CLOSE ERROR: {str(e)}")
+        return
 
     send(
-        f"{'🎯' if pnl>=0 else '🛑'} {reason}\n\n"
+        f"{'🎯' if pnl>=0 else '🛑'} {reason}\n"
         f"{t['symbol']} {t['side']}\n"
-        f"Entry: {round(t['entry'],4)}\n"
-        f"Exit: {round(px,4)}\n"
-        f"PnL: ${round(pnl,2)}\n"
-        f"🕒 {ts()}"
+        f"PnL: ${round(pnl,2)}\n🕒 {ts()}"
     )
 
     open_trade = None
@@ -221,7 +253,8 @@ def close(reason, px):
 # ==========================================================
 # START
 # ==========================================================
-send(f"✅ TRUE SCALPER v4 STARTED\n🕒 {ts()}")
+load_filters()
+send(f"✅ TRUE SCALPER V5.1 STARTED\n🕒 {ts()}")
 
 # ==========================================================
 # LOOP
@@ -229,17 +262,12 @@ send(f"✅ TRUE SCALPER v4 STARTED\n🕒 {ts()}")
 while True:
 
     try:
-
         if time.time() - last_heartbeat > 3600:
             send(f"💓 BOT ACTIVE | {ts()}")
             last_heartbeat = time.time()
 
         if open_trade:
             manage()
-            time.sleep(WAIT)
-            continue
-
-        if not session():
             time.sleep(WAIT)
             continue
 
@@ -255,18 +283,13 @@ while True:
             if sig:
                 px = df.iloc[-1]["close"]
 
-                send(
-                    f"🔥 SIGNAL DETECTED\n"
-                    f"{s} | {sig}\n"
-                    f"Price: {round(px,4)}\n"
-                    f"🕒 {ts()}"
-                )
+                send(f"🔥 SIGNAL {s} {sig} @ {round(px,4)}")
 
                 open_pos(s, sig, px)
                 break
 
         time.sleep(WAIT)
 
-    except:
-        send("❌ ERROR RECOVERY")
+    except Exception as e:
+        send(f"❌ ERROR: {str(e)}")
         time.sleep(10)

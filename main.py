@@ -1,5 +1,5 @@
 # ==========================================================
-# TRUE SCALPER V5.1 - FINAL SNIPER (PRECISION FIXED)
+# TRUE SCALPER V6 - SNIPER EDITION
 # ==========================================================
 
 import os, time, requests, pandas as pd
@@ -28,6 +28,7 @@ CAPITAL = 0.12
 open_trade = None
 last_heartbeat = 0
 last_trade_time = {}
+loss_streak = {}
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -55,12 +56,6 @@ def send(msg):
             pass
 
 # ==========================================================
-# SESSION (24/7 CRYPTO)
-# ==========================================================
-def session():
-    return True
-
-# ==========================================================
 # DATA
 # ==========================================================
 def klines(symbol):
@@ -76,49 +71,71 @@ def frame(raw):
     df.columns = ["open","high","low","close","volume"]
     return df
 
+# ==========================================================
+# INDICATORS
+# ==========================================================
 def enrich(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
+
     df["body"] = abs(df["close"] - df["open"])
     df["body_avg"] = df["body"].rolling(20).mean()
+
+    df["vol_avg"] = df["volume"].rolling(20).mean()
+
+    # RSI
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
     return df
 
 # ==========================================================
-# SIGNAL
+# SNIPER SIGNAL
 # ==========================================================
 def signal(df):
+
     c = df.iloc[-1]
     p = df.iloc[-2]
 
-    if c["ema20"] > c["ema50"]:
-        if c["close"] > p["high"] and c["body"] > df["body_avg"].iloc[-1]:
+    trend_up = c["ema20"] > c["ema50"]
+    trend_down = c["ema20"] < c["ema50"]
+
+    strong_body = c["body"] > 1.2 * df["body_avg"].iloc[-1]
+    high_volume = c["volume"] > 1.5 * df["vol_avg"].iloc[-1]
+
+    trend_strength = abs(c["ema20"] - c["ema50"]) / c["close"]
+
+    if trend_strength < 0.001:
+        return None
+
+    # BUY
+    if trend_up and strong_body and high_volume:
+        if c["close"] > p["high"] and c["rsi"] < 65:
             return "BUY"
 
-    if c["ema20"] < c["ema50"]:
-        if c["close"] < p["low"] and c["body"] > df["body_avg"].iloc[-1]:
+    # SELL
+    if trend_down and strong_body and high_volume:
+        if c["close"] < p["low"] and c["rsi"] > 35:
             return "SELL"
 
     return None
 
 # ==========================================================
-# PRECISION ENGINE (CRITICAL FIX)
+# PRECISION
 # ==========================================================
 symbol_filters = {}
 
 def load_filters():
-    global symbol_filters
     info = client.futures_exchange_info()
-
     for s in info["symbols"]:
         symbol = s["symbol"]
         filters = {f["filterType"]: f for f in s["filters"]}
-
-        step = float(filters["LOT_SIZE"]["stepSize"])
-        tick = float(filters["PRICE_FILTER"]["tickSize"])
-
         symbol_filters[symbol] = {
-            "step": step,
-            "tick": tick
+            "step": float(filters["LOT_SIZE"]["stepSize"]),
+            "tick": float(filters["PRICE_FILTER"]["tickSize"])
         }
 
 def round_qty(symbol, qty):
@@ -151,19 +168,21 @@ def order(symbol, side, qty):
 def open_pos(symbol, side, px):
     global open_trade
 
-    # anti-spam cooldown
-    if symbol in last_trade_time:
-        if time.time() - last_trade_time[symbol] < 120:
+    # cooldown after loss streak
+    if symbol in loss_streak and loss_streak[symbol] >= 2:
+        if time.time() - last_trade_time.get(symbol, 0) < 1800:
             return
+
+    # anti spam
+    if time.time() - last_trade_time.get(symbol, 0) < 600:
+        return
 
     bal = balance()
     pos = bal * CAPITAL * LEVERAGE
 
-    qty = pos / px
-    qty = round_qty(symbol, qty)
+    qty = round_qty(symbol, pos / px)
 
     if qty <= 0:
-        send(f"❌ QTY ERROR {symbol}")
         return
 
     try:
@@ -195,11 +214,7 @@ def open_pos(symbol, side, px):
 
     last_trade_time[symbol] = time.time()
 
-    send(
-        f"🚀 ENTRY\n{symbol} {side}\n"
-        f"Entry: {round(px,4)}\nTP: {tp}\nSL: {sl}\n"
-        f"Qty: {qty}\n🕒 {ts()}"
-    )
+    send(f"🚀 {symbol} {side} @ {round(px,4)}")
 
 # ==========================================================
 # EXIT
@@ -238,15 +253,17 @@ def close(reason, px):
 
     try:
         order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
-    except Exception as e:
-        send(f"❌ CLOSE ERROR: {str(e)}")
+    except:
         return
 
-    send(
-        f"{'🎯' if pnl>=0 else '🛑'} {reason}\n"
-        f"{t['symbol']} {t['side']}\n"
-        f"PnL: ${round(pnl,2)}\n🕒 {ts()}"
-    )
+    sym = t["symbol"]
+
+    if pnl < 0:
+        loss_streak[sym] = loss_streak.get(sym, 0) + 1
+    else:
+        loss_streak[sym] = 0
+
+    send(f"{reason} | {sym} | PnL: {round(pnl,2)}")
 
     open_trade = None
 
@@ -254,7 +271,7 @@ def close(reason, px):
 # START
 # ==========================================================
 load_filters()
-send(f"✅ TRUE SCALPER V5.1 STARTED\n🕒 {ts()}")
+send(f"✅ TRUE SCALPER V6 STARTED | {ts()}")
 
 # ==========================================================
 # LOOP
@@ -263,7 +280,7 @@ while True:
 
     try:
         if time.time() - last_heartbeat > 3600:
-            send(f"💓 BOT ACTIVE | {ts()}")
+            send(f"💓 ACTIVE {ts()}")
             last_heartbeat = time.time()
 
         if open_trade:
@@ -282,9 +299,7 @@ while True:
 
             if sig:
                 px = df.iloc[-1]["close"]
-
-                send(f"🔥 SIGNAL {s} {sig} @ {round(px,4)}")
-
+                send(f"🔥 {s} {sig}")
                 open_pos(s, sig, px)
                 break
 

@@ -1,12 +1,8 @@
 # ==========================================================
-# SNIPER V7.1 - TEST MODE + ANALYTICS ENGINE
-# - Multi TF logic
-# - Confidence score
-# - Auto trading (testnet)
-# - Trade journal + performance stats
+# SNIPER V7.1 FINAL - TEST MODE + ANALYTICS + PRECISION FIX
 # ==========================================================
 
-import os, time, requests, pandas as pd
+import os, time, math, requests, pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from binance.client import Client
@@ -27,14 +23,11 @@ LEVERAGE = 3
 CAPITAL = 0.10
 TP = 0.8
 SL = 0.4
-
 WAIT = 15
 
 open_trade = None
+last_signal = {}
 
-# =========================
-# 📊 PERFORMANCE TRACKER
-# =========================
 stats = {
     "total": 0,
     "wins": 0,
@@ -44,11 +37,13 @@ stats = {
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# ================= TIME =================
 def ts():
     now = datetime.now(timezone.utc)
     ist = now.astimezone(IST)
     return f"{now.strftime('%H:%M:%S')} | {ist.strftime('%H:%M:%S')} IST"
 
+# ================= TELEGRAM =================
 def send(msg):
     print(msg, flush=True)
     if TOKEN and CHAT_ID:
@@ -61,9 +56,7 @@ def send(msg):
         except:
             pass
 
-# =========================
-# 📊 DATA
-# =========================
+# ================= DATA =================
 def get_klines(symbol, tf):
     return client.get_klines(symbol=symbol, interval=tf, limit=100)
 
@@ -85,9 +78,7 @@ def indicators(df):
 
     return df
 
-# =========================
-# 🧠 SIGNAL ENGINE
-# =========================
+# ================= SIGNAL =================
 def analyze(symbol):
 
     df15 = indicators(df_format(get_klines(symbol,"15m")))
@@ -99,7 +90,6 @@ def analyze(symbol):
     score = 0
     reasons = []
 
-    # TREND
     if c["ema20"] > c["ema50"]:
         trend = "UP"
         score += 30
@@ -107,7 +97,6 @@ def analyze(symbol):
         trend = "DOWN"
         score += 30
 
-    # STRUCTURE BREAK
     if trend == "UP" and c["close"] > p["high"]:
         score += 20
         reasons.append("Breakout")
@@ -115,17 +104,14 @@ def analyze(symbol):
         score += 20
         reasons.append("Breakdown")
 
-    # RSI
     if 50 < c["rsi"] < 70:
         score += 15
         reasons.append("RSI Strength")
 
-    # VOLUME
     if c["volume"] > df15["volume"].rolling(20).mean().iloc[-1]:
         score += 15
         reasons.append("Volume Spike")
 
-    # LOWER TF CONFIRMATION
     c5 = df5.iloc[-1]
     if trend == "UP" and c5["ema20"] > c5["ema50"]:
         score += 20
@@ -138,9 +124,7 @@ def analyze(symbol):
 
     return None, score, []
 
-# =========================
-# 💰 EXECUTION
-# =========================
+# ================= EXECUTION =================
 def price(symbol):
     return float(client.get_symbol_ticker(symbol=symbol)["price"])
 
@@ -150,10 +134,26 @@ def balance():
             return float(x["balance"])
 
 def get_qty(symbol, px):
-    info = client.get_symbol_info(symbol)
-    step = float([f for f in info["filters"] if f["filterType"]=="LOT_SIZE"][0]["stepSize"])
+
+    info = client.futures_exchange_info()
+    symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
+
+    lot_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
+
+    step_size = float(lot_filter["stepSize"])
+    min_qty   = float(lot_filter["minQty"])
+
     qty = (balance() * CAPITAL * LEVERAGE) / px
-    return round(qty - (qty % step), 6)
+
+    precision = int(round(-math.log(step_size, 10), 0))
+
+    qty = round(qty, precision)
+    qty = math.floor(qty / step_size) * step_size
+
+    if qty < min_qty:
+        return None
+
+    return float(f"{qty:.{precision}f}")
 
 def order(symbol, side, qty):
     return client.futures_create_order(
@@ -169,6 +169,10 @@ def open_position(symbol, side, score, reasons):
 
     px = price(symbol)
     qty = get_qty(symbol, px)
+
+    if not qty:
+        send(f"⚠️ QTY TOO LOW: {symbol}")
+        return
 
     try:
         order(symbol, side, qty)
@@ -197,13 +201,12 @@ def open_position(symbol, side, score, reasons):
 
     send(
         f"🚀 ENTRY\n{symbol} {side}\n"
-        f"Entry: {round(px,4)}\nTP: {round(tp,4)}\nSL: {round(sl,4)}\n"
-        f"Score: {score}\nReasons: {', '.join(reasons)}\n🕒 {ts()}"
+        f"Entry: {round(px,4)} | TP: {round(tp,4)} | SL: {round(sl,4)}\n"
+        f"Qty: {qty} | Score: {score}\n"
+        f"Reason: {', '.join(reasons)}\n🕒 {ts()}"
     )
 
-# =========================
-# 🔚 EXIT + ANALYTICS
-# =========================
+# ================= EXIT =================
 def manage():
 
     global open_trade
@@ -242,7 +245,6 @@ def close_trade(reason, px):
 
     order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
 
-    # UPDATE STATS
     stats["total"] += 1
     stats["pnl"] += pnl
 
@@ -255,24 +257,18 @@ def close_trade(reason, px):
 
     send(
         f"{'🎯' if pnl>=0 else '🛑'} EXIT {reason}\n"
-        f"{t['symbol']} {t['side']}\n"
-        f"PnL: ${round(pnl,2)}\n\n"
-        f"📊 STATS\n"
-        f"Trades: {stats['total']}\n"
-        f"Wins: {stats['wins']} | Loss: {stats['loss']}\n"
-        f"Winrate: {round(winrate,1)}%\n"
-        f"Net: ${round(stats['pnl'],2)}\n"
-        f"🧠 Entry Reason: {', '.join(t['reasons'])}\n"
-        f"🕒 {ts()}"
+        f"{t['symbol']} {t['side']} | PnL: ${round(pnl,2)}\n\n"
+        f"📊 Trades: {stats['total']} | Winrate: {round(winrate,1)}%\n"
+        f"W: {stats['wins']} | L: {stats['loss']} | Net: ${round(stats['pnl'],2)}\n"
+        f"🧠 Reason: {', '.join(t['reasons'])}\n🕒 {ts()}"
     )
 
     open_trade = None
 
-# =========================
-# 🚀 START
-# =========================
-send(f"✅ SNIPER V7.1 STARTED | {ts()}")
+# ================= START =================
+send(f"✅ SNIPER V7.1 FINAL STARTED | {ts()}")
 
+# ================= LOOP =================
 while True:
 
     try:
@@ -284,10 +280,16 @@ while True:
 
         for s in SYMBOLS:
 
+            now = time.time()
+
+            if s in last_signal and now - last_signal[s] < 300:
+                continue
+
             side, score, reasons = analyze(s)
 
             if side:
                 send(f"📊 SIGNAL {s} {side} | Score {score}")
+                last_signal[s] = now
                 open_position(s, side, score, reasons)
                 break
 

@@ -1,76 +1,71 @@
-# ==========================================================
-# SNIPER V7.1 FINAL - TEST MODE + ANALYTICS + PRECISION FIX
-# ==========================================================
-
-import os, time, math, requests, pandas as pd
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+import time
+import math
+from datetime import datetime
 from binance.client import Client
+import pandas as pd
+import requests
 
-load_dotenv()
+# ================= CONFIG =================
+API_KEY = "YOUR_KEY"
+API_SECRET = "YOUR_SECRET"
 
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = "YOUR_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+INTERVAL = Client.KLINE_INTERVAL_15MINUTE
+RISK_PER_TRADE = 0.02
 
 client = Client(API_KEY, API_SECRET)
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-
-SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
-
-LEVERAGE = 3
-CAPITAL = 0.10
-TP = 0.8
-SL = 0.4
-WAIT = 15
-
-open_trade = None
-last_signal = {}
-
-stats = {
-    "total": 0,
-    "wins": 0,
-    "loss": 0,
-    "pnl": 0.0
-}
-
-IST = timezone(timedelta(hours=5, minutes=30))
-
-# ================= TIME =================
-def ts():
-    now = datetime.now(timezone.utc)
-    ist = now.astimezone(IST)
-    return f"{now.strftime('%H:%M:%S')} | {ist.strftime('%H:%M:%S')} IST"
 
 # ================= TELEGRAM =================
-def send(msg):
-    print(msg, flush=True)
-    if TOKEN and CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=5
-            )
-        except:
-            pass
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except:
+        pass
+
+# ================= SESSION ENGINE =================
+def get_session():
+    hour = datetime.utcnow().hour + 5.5  # IST
+
+    if 1.5 <= hour < 4.5:
+        return "AVOID"
+    elif 4.5 <= hour < 9:
+        return "LOW"
+    elif 9 <= hour < 15:
+        return "MID"
+    elif 15 <= hour < 21:
+        return "HIGH"
+    else:
+        return "BEST"
+
+# ================= PRECISION FIX =================
+def adjust_precision(symbol, qty):
+    info = client.futures_exchange_info()
+    for s in info['symbols']:
+        if s['symbol'] == symbol:
+            step_size = float([f for f in s['filters'] if f['filterType'] == 'LOT_SIZE'][0]['stepSize'])
+            precision = int(round(-math.log(step_size, 10), 0))
+            return round(qty, precision)
+    return qty
 
 # ================= DATA =================
-def get_klines(symbol, tf):
-    return client.get_klines(symbol=symbol, interval=tf, limit=100)
-
-def df_format(raw):
-    df = pd.DataFrame(raw, columns=["t","o","h","l","c","v","ct","qv","n","tb","tq","ig"])
-    df = df[["o","h","l","c","v"]].astype(float)
-    df.columns = ["open","high","low","close","volume"]
+def get_data(symbol):
+    klines = client.futures_klines(symbol=symbol, interval=INTERVAL, limit=100)
+    df = pd.DataFrame(klines)
+    df.columns = ["time","o","h","l","c","v","ct","q","n","tbb","tbq","ig"]
+    df["c"] = df["c"].astype(float)
+    df["v"] = df["v"].astype(float)
     return df
 
+# ================= INDICATORS =================
 def indicators(df):
-    df["ema20"] = df["close"].ewm(span=20).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema20"] = df["c"].ewm(span=20).mean()
+    df["ema50"] = df["c"].ewm(span=50).mean()
 
-    delta = df["close"].diff()
+    delta = df["c"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
@@ -78,223 +73,177 @@ def indicators(df):
 
     return df
 
-# ================= SIGNAL =================
-def analyze(symbol):
+# ================= TREND =================
+def trend(df):
+    if df["ema20"].iloc[-1] > df["ema50"].iloc[-1]:
+        return "UP"
+    elif df["ema20"].iloc[-1] < df["ema50"].iloc[-1]:
+        return "DOWN"
+    return "SIDE"
 
-    df15 = indicators(df_format(get_klines(symbol,"15m")))
-    df5  = indicators(df_format(get_klines(symbol,"5m")))
+# ================= ENTRY LOGIC =================
+def entry_signal(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    c = df15.iloc[-1]
-    p = df15.iloc[-2]
+    breakout_up = last["c"] > prev["h"]
+    breakout_down = last["c"] < prev["l"]
+
+    rsi_strong = last["rsi"] > 55 or last["rsi"] < 45
+    volume_spike = last["v"] > df["v"].rolling(20).mean().iloc[-1]
 
     score = 0
-    reasons = []
+    reason = []
 
-    if c["ema20"] > c["ema50"]:
-        trend = "UP"
+    if breakout_up:
         score += 30
+        reason.append("Breakout Up")
+    if breakout_down:
+        score += 30
+        reason.append("Breakout Down")
+    if rsi_strong:
+        score += 20
+        reason.append("RSI")
+    if volume_spike:
+        score += 20
+        reason.append("Volume")
+
+    return score, reason, breakout_up, breakout_down
+
+# ================= RISK =================
+def get_levels(price, direction):
+    sl_pct = 0.4 / 100
+    tp_pct = 0.8 / 100  # 1:2 RR
+
+    if direction == "BUY":
+        sl = price * (1 - sl_pct)
+        tp = price * (1 + tp_pct)
     else:
-        trend = "DOWN"
-        score += 30
+        sl = price * (1 + sl_pct)
+        tp = price * (1 - tp_pct)
 
-    if trend == "UP" and c["close"] > p["high"]:
-        score += 20
-        reasons.append("Breakout")
-    elif trend == "DOWN" and c["close"] < p["low"]:
-        score += 20
-        reasons.append("Breakdown")
+    return sl, tp
 
-    if 50 < c["rsi"] < 70:
-        score += 15
-        reasons.append("RSI Strength")
+# ================= POSITION SIZE =================
+def get_qty(symbol, price):
+    balance = 100  # demo
+    risk = balance * RISK_PER_TRADE
+    qty = risk / price
+    return adjust_precision(symbol, qty)
 
-    if c["volume"] > df15["volume"].rolling(20).mean().iloc[-1]:
-        score += 15
-        reasons.append("Volume Spike")
+# ================= STATS =================
+stats = {
+    "trades": 0,
+    "wins": 0,
+    "loss": 0,
+    "net": 0,
+    "session": {}
+}
 
-    c5 = df5.iloc[-1]
-    if trend == "UP" and c5["ema20"] > c5["ema50"]:
-        score += 20
-    elif trend == "DOWN" and c5["ema20"] < c5["ema50"]:
-        score += 20
+# ================= TRADE EXECUTION =================
+def execute_trade(symbol):
+    df = indicators(get_data(symbol))
+    t = trend(df)
 
-    if score >= 70:
-        side = "BUY" if trend == "UP" else "SELL"
-        return side, score, reasons
+    score, reason, up, down = entry_signal(df)
+    session = get_session()
 
-    return None, score, []
-
-# ================= EXECUTION =================
-def price(symbol):
-    return float(client.get_symbol_ticker(symbol=symbol)["price"])
-
-def balance():
-    for x in client.futures_account_balance():
-        if x["asset"] == "USDT":
-            return float(x["balance"])
-
-def get_qty(symbol, px):
-
-    info = client.futures_exchange_info()
-    symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
-
-    lot_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
-
-    step_size = float(lot_filter["stepSize"])
-    min_qty   = float(lot_filter["minQty"])
-
-    qty = (balance() * CAPITAL * LEVERAGE) / px
-
-    precision = int(round(-math.log(step_size, 10), 0))
-
-    qty = round(qty, precision)
-    qty = math.floor(qty / step_size) * step_size
-
-    if qty < min_qty:
-        return None
-
-    return float(f"{qty:.{precision}f}")
-
-def order(symbol, side, qty):
-    return client.futures_create_order(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        quantity=qty
-    )
-
-def open_position(symbol, side, score, reasons):
-
-    global open_trade
-
-    px = price(symbol)
-    qty = get_qty(symbol, px)
-
-    if not qty:
-        send(f"⚠️ QTY TOO LOW: {symbol}")
+    # Session filter
+    if session == "AVOID":
         return
 
+    if session == "LOW" and score < 85:
+        return
+
+    if session in ["MID","HIGH","BEST"] and score < 70:
+        return
+
+    price = df["c"].iloc[-1]
+
+    # Trend alignment
+    if up and t != "UP":
+        return
+    if down and t != "DOWN":
+        return
+
+    direction = "BUY" if up else "SELL"
+    sl, tp = get_levels(price, direction)
+    qty = get_qty(symbol, price)
+
     try:
-        order(symbol, side, qty)
+        client.futures_create_order(
+            symbol=symbol,
+            side="BUY" if direction=="BUY" else "SELL",
+            type="MARKET",
+            quantity=qty
+        )
     except Exception as e:
-        send(f"❌ ORDER ERROR: {e}")
+        print("ORDER ERROR:", e)
         return
 
-    if side == "BUY":
-        tp = px * (1 + TP/100)
-        sl = px * (1 - SL/100)
-    else:
-        tp = px * (1 - TP/100)
-        sl = px * (1 + SL/100)
-
-    open_trade = {
-        "symbol": symbol,
-        "side": side,
-        "entry": px,
-        "tp": tp,
-        "sl": sl,
-        "qty": qty,
-        "score": score,
-        "reasons": reasons,
-        "time": time.time()
-    }
-
-    send(
-        f"🚀 ENTRY\n{symbol} {side}\n"
-        f"Entry: {round(px,4)} | TP: {round(tp,4)} | SL: {round(sl,4)}\n"
-        f"Qty: {qty} | Score: {score}\n"
-        f"Reason: {', '.join(reasons)}\n🕒 {ts()}"
+    send_telegram(
+        f"🚀 {symbol} {direction}\n"
+        f"Entry: {price}\nTP: {tp}\nSL: {sl}\n"
+        f"Score: {score}\nSession: {session}\nReason: {', '.join(reason)}"
     )
 
-# ================= EXIT =================
-def manage():
+    manage_trade(symbol, price, tp, sl, direction, session)
 
-    global open_trade
+# ================= TRADE MANAGEMENT =================
+def manage_trade(symbol, entry, tp, sl, direction, session):
+    global stats
 
-    if not open_trade:
-        return
+    partial_done = False
 
-    t = open_trade
-    px = price(t["symbol"])
+    while True:
+        price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
 
-    hit = None
+        # Partial profit
+        if not partial_done:
+            if (direction=="BUY" and price >= (entry + (tp-entry)/2)) or \
+               (direction=="SELL" and price <= (entry - (entry-tp)/2)):
+                partial_done = True
+                sl = entry  # move SL to breakeven
+                send_telegram(f"⚡ Partial Profit {symbol} | SL moved to BE")
 
-    if t["side"] == "BUY":
-        if px >= t["tp"]:
-            hit = "TP"
-        elif px <= t["sl"]:
-            hit = "SL"
-    else:
-        if px <= t["tp"]:
-            hit = "TP"
-        elif px >= t["sl"]:
-            hit = "SL"
+        # TP
+        if (direction=="BUY" and price >= tp) or (direction=="SELL" and price <= tp):
+            pnl = abs(tp-entry)
+            stats["wins"] += 1
+            stats["net"] += pnl
+            result = "TP"
 
-    if hit or (time.time()-t["time"])/60 > 25:
-        close_trade(hit if hit else "TIME", px)
-
-def close_trade(reason, px):
-
-    global open_trade, stats
-
-    t = open_trade
-
-    pnl = ((px - t["entry"]) / t["entry"]) * (balance() * CAPITAL * LEVERAGE)
-    if t["side"] == "SELL":
-        pnl = -pnl
-
-    order(t["symbol"], "SELL" if t["side"]=="BUY" else "BUY", t["qty"])
-
-    stats["total"] += 1
-    stats["pnl"] += pnl
-
-    if pnl >= 0:
-        stats["wins"] += 1
-    else:
-        stats["loss"] += 1
-
-    winrate = (stats["wins"]/stats["total"])*100
-
-    send(
-        f"{'🎯' if pnl>=0 else '🛑'} EXIT {reason}\n"
-        f"{t['symbol']} {t['side']} | PnL: ${round(pnl,2)}\n\n"
-        f"📊 Trades: {stats['total']} | Winrate: {round(winrate,1)}%\n"
-        f"W: {stats['wins']} | L: {stats['loss']} | Net: ${round(stats['pnl'],2)}\n"
-        f"🧠 Reason: {', '.join(t['reasons'])}\n🕒 {ts()}"
-    )
-
-    open_trade = None
-
-# ================= START =================
-send(f"✅ SNIPER V7.1 FINAL STARTED | {ts()}")
-
-# ================= LOOP =================
-while True:
-
-    try:
-
-        if open_trade:
-            manage()
-            time.sleep(WAIT)
+        # SL
+        elif (direction=="BUY" and price <= sl) or (direction=="SELL" and price >= sl):
+            pnl = -abs(entry-sl)
+            stats["loss"] += 1
+            stats["net"] += pnl
+            result = "SL"
+        else:
+            time.sleep(2)
             continue
 
-        for s in SYMBOLS:
+        stats["trades"] += 1
 
-            now = time.time()
+        # Session tracking
+        stats["session"].setdefault(session, 0)
+        stats["session"][session] += pnl
 
-            if s in last_signal and now - last_signal[s] < 300:
-                continue
+        send_telegram(
+            f"🎯 EXIT {symbol} | {result}\nPnL: {round(pnl,2)}\n\n"
+            f"Trades: {stats['trades']} | Winrate: {round(stats['wins']/stats['trades']*100,1)}%\n"
+            f"Net: {round(stats['net'],2)}\nSession Stats: {stats['session']}"
+        )
 
-            side, score, reasons = analyze(s)
+        break
 
-            if side:
-                send(f"📊 SIGNAL {s} {side} | Score {score}")
-                last_signal[s] = now
-                open_position(s, side, score, reasons)
-                break
+# ================= MAIN LOOP =================
+print("✅ SNIPER V8 STARTED")
 
-        time.sleep(WAIT)
-
-    except Exception as e:
-        send(f"❌ ERROR: {e}")
-        time.sleep(5)
+while True:
+    for s in SYMBOLS:
+        try:
+            execute_trade(s)
+        except Exception as e:
+            print("Error:", e)
+    time.sleep(10)
